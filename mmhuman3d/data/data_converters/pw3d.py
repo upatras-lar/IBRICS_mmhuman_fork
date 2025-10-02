@@ -50,17 +50,23 @@ class Pw3dConverter(BaseModeConverter):
 
         # structs we use
         image_path_, bbox_xywh_ = [], []
-        smpl = {}
-        smpl['body_pose'] = []
-        smpl['global_orient'] = []
-        smpl['betas'] = []
+        smpl = {
+            'body_pose': [],
+            'global_orient': [],   # world frame
+            'global_trans': [],    # world frame
+            'camera_orient': [],   # camera frame
+            'camera_trans': [],    # camera frame
+            'betas': []
+        }
+
         meta = {}
-        meta['gender'] = []
+        # meta['gender'] = []
 
         # ---- New: numeric camera storage (float32) with deduplicated intrinsics ----
         # Global (dataset-level) intrinsics pool and per-frame index
         K_pool_list: List[np.ndarray] = []
-        K_pool_map = {}  # key: bytes of K(float32).tobytes(), value: index in K_pool_list
+        # key: bytes of K(float32).tobytes(), value: index in K_pool_list
+        K_pool_map = {}
         K_idx_list: List[int] = []
 
         R_list: List[np.ndarray] = []
@@ -81,75 +87,95 @@ class Pw3dConverter(BaseModeConverter):
         for filename in tqdm(files):
             with open(filename, 'rb') as f:
                 data = pickle.load(f, encoding='latin1')
-                smpl_pose = data['poses']
+
+                # used
+                seq_name = str(data['sequence'])
                 smpl_betas = data['betas']
+                smpl_pose = data['poses']
+                K = np.array(data['cam_intrinsics'])
+                world_trans = data["trans"]
+                valid = np.asarray(data['campose_valid'], dtype=bool)
+
+                # maybe
                 poses2d = data['poses2d']
                 global_poses = data['cam_poses']
-                genders = data['genders']
-                valid = np.array(data['campose_valid']).astype(bool)
-                K = np.array(data['cam_intrinsics'])
+
+                # not in dataset
                 num_people = len(smpl_pose)
                 num_frames = len(smpl_pose[0])
-                seq_name = str(data['sequence'])
                 img_names = np.array([
                     'imageFiles/' + seq_name + f'/image_{str(i).zfill(5)}.jpg'
                     for i in range(num_frames)
                 ])
+
                 # get through all the people in the sequence
                 for i in range(num_people):
                     valid_pose = smpl_pose[i][valid[i]]
                     valid_betas = np.tile(smpl_betas[i][:10].reshape(1, -1),
                                           (num_frames, 1))
                     valid_betas = valid_betas[valid[i]]
-                    valid_keypoints_2d = poses2d[i][valid[i]]
                     valid_img_names = img_names[valid[i]]
                     valid_global_poses = global_poses[valid[i]]
-                    gender = genders[i]
+                    valid_world_trans = world_trans[i][valid[i]]
+                    valid_keypoints_2d = poses2d[i][valid[i]] if poses2d is not None else None
 
                     # consider only valid frames
                     for valid_i in range(valid_pose.shape[0]):
-                        keypoints2d = valid_keypoints_2d[valid_i, :, :].T
-                        keypoints2d = keypoints2d[keypoints2d[:, 2] > 0, :]
-                        bbox_xyxy = [
-                            min(keypoints2d[:, 0]),
-                            min(keypoints2d[:, 1]),
-                            max(keypoints2d[:, 0]),
-                            max(keypoints2d[:, 1])
-                        ]
-
-                        bbox_xyxy = self._bbox_expand(
-                            bbox_xyxy, scale_factor=1.2)
-                        bbox_xywh = self._xyxy2xywh(bbox_xyxy)
+                        have_bbox = False
+                        if valid_keypoints_2d is not None:
+                            # (18,3): [x,y,conf]
+                            k = valid_keypoints_2d[valid_i].T
+                            ok = np.isfinite(k[:, 2]) & (k[:, 2] > 0.0)
+                            if ok.sum() >= 6:
+                                xy = k[ok, :2]
+                                x0, y0 = xy.min(axis=0)
+                                x1, y1 = xy.max(axis=0)
+                                bbox_xyxy = [x0, y0, x1, y1]
+                                bbox_xyxy = self._bbox_expand(
+                                    bbox_xyxy, scale_factor=1.2)
+                                bbox_xywh = self._xyxy2xywh(bbox_xyxy)
+                                have_bbox = True
+                        if not have_bbox:
+                            continue
 
                         image_path = valid_img_names[valid_i]
                         image_abs_path = os.path.join(root_path, image_path)
                         h, w, _ = cv2.imread(image_abs_path).shape
 
                         # transform global pose
-                        pose = valid_pose[valid_i]
-                        extrinsic_param = valid_global_poses[valid_i]
-                        R = extrinsic_param[:3, :3]
-                        T = extrinsic_param[:3, 3]
+                        pose = valid_pose[valid_i].copy()
+                        l_pose = valid_pose[valid_i].copy()
 
-                        # Keep constructing camera (unchanged), but do not store dict per frame
-                        camera = CameraParameter(H=h, W=w)
-                        camera.set_KRT(K, R, T)
-                        # parameter_dict = camera.to_dict()  # (removed from storage)
+                        # World Frame
 
-                        # Update root-orient by applying R (unchanged)
-                        pose[:3] = cv2.Rodrigues(
-                            np.dot(R,
-                                   cv2.Rodrigues(pose[:3])[0]))[0].T[0]
+                        smpl['body_pose'].append(pose[3:].reshape((23, 3)))
+                        smpl['global_orient'].append(pose[:3])
+                        smpl['global_trans'].append(valid_world_trans[valid_i])
+                        smpl['betas'].append(valid_betas[valid_i])
+
+                        # meta['gender'].append(gender)
+
+                        # Camera Stuff
+                        E = valid_global_poses[valid_i]
+                        R = E[:3, :3]
+                        T = E[:3, 3]
+
+                        # rotate root orientation into camera frame
+                        R_root = cv2.Rodrigues(l_pose[:3])[0]
+                        R_root_cam = R @ R_root
+                        rvec_cam = cv2.Rodrigues(R_root_cam)[0].ravel()
+                        smpl['camera_orient'].append(rvec_cam)
+
+                        # translate root into camera frame
+                        t_world = valid_world_trans[valid_i]
+                        t_cam = (R @ t_world) + T
+                        smpl['camera_trans'].append(t_cam)
 
                         image_path_.append(image_path)
                         bbox_xywh_.append(bbox_xywh)
-                        smpl['body_pose'].append(pose[3:].reshape((23, 3)))
-                        smpl['global_orient'].append(pose[:3])
-                        smpl['betas'].append(valid_betas[valid_i])
-                        meta['gender'].append(gender)
 
-                        # ---- New: collect numeric camera data ----
-                        # Cast to float32 for compact storage
+                        # REVIEW if necessary
+                        # float32 for compact storage
                         K_f32 = np.asarray(K, dtype=np.float32)
                         R_f32 = np.asarray(R, dtype=np.float32)
                         T_f32 = np.asarray(T, dtype=np.float32)
@@ -168,33 +194,60 @@ class Pw3dConverter(BaseModeConverter):
                         T_list.append(T_f32)
                         H_list.append(np.float32(h))
                         W_list.append(np.float32(w))
-                        # -----------------------------------------
 
-        # change list to np array (unchanged for existing fields)
+        # change list to np array
         bbox_xywh_ = np.array(bbox_xywh_).reshape((-1, 4))
         bbox_xywh_ = np.hstack([bbox_xywh_, np.ones([bbox_xywh_.shape[0], 1])])
-        smpl['body_pose'] = np.array(smpl['body_pose']).reshape((-1, 23, 3))
-        smpl['global_orient'] = np.array(smpl['global_orient']).reshape(
-            (-1, 3))
-        smpl['betas'] = np.array(smpl['betas']).reshape((-1, 10))
-        meta['gender'] = np.array(meta['gender'])
+        
+        
+        
+        smpl['global_trans'] = np.asarray(
+            smpl['global_trans'],  dtype=np.float32)
+        smpl['camera_orient'] = np.asarray(
+            smpl['camera_orient'], dtype=np.float32)
+        smpl['camera_trans'] = np.asarray(
+            smpl['camera_trans'],  dtype=np.float32)
+        smpl['body_pose'] = np.asarray(
+            smpl['body_pose'],     dtype=np.float32).reshape(-1, 23, 3)
+        smpl['global_orient'] = np.asarray(
+            smpl['global_orient'], dtype=np.float32).reshape(-1, 3)
+        smpl['betas'] = np.asarray(
+            smpl['betas'],         dtype=np.float32).reshape(-1, 10)
+        
+        
+        N = len(image_path_)
+        assert all(len(smpl[k]) == N for k in ['body_pose','global_orient','global_trans',
+                                            'camera_orient','camera_trans','betas'])
+        assert len(bbox_xywh_) == N == len(K_idx_list) == len(R_list) == len(T_list) == len(H_list) == len(W_list)
+        
+        
+        # shapes
+        assert smpl['body_pose'].shape[1:] == (23,3)
+        assert smpl['global_orient'].shape[1] == 3
+        assert smpl['global_trans'].shape[1] == 3
+        assert smpl['camera_orient'].shape[1] == 3
+        assert smpl['camera_trans'].shape[1] == 3
+
+        # meta['gender'] = np.array(meta['gender'])
 
         human_data['image_path'] = image_path_
         human_data['bbox_xywh'] = bbox_xywh_
         human_data['smpl'] = smpl
-        human_data['meta'] = meta
 
-        # ---- New: pack numeric camera arrays into a single dict ----
         if K_pool_list:
-            K_pool = np.stack(K_pool_list, axis=0).astype(np.float32, copy=False)  # (M, 3, 3)
+            K_pool = np.stack(K_pool_list, axis=0).astype(
+                np.float32, copy=False)  # (M, 3, 3)
         else:
             K_pool = np.empty((0, 3, 3), dtype=np.float32)
 
         cam_param = {
             'K_pool': K_pool,                                   # unique intrinsics
-            'K_idx': np.asarray(K_idx_list, dtype=np.int32),    # per-frame index
-            'R': np.stack(R_list, axis=0).astype(np.float32, copy=False),  # (N, 3, 3)
-            'T': np.stack(T_list, axis=0).astype(np.float32, copy=False),  # (N, 3)
+            # per-frame index
+            'K_idx': np.asarray(K_idx_list, dtype=np.int32),
+            # (N, 3, 3)
+            'R': np.stack(R_list, axis=0).astype(np.float32, copy=False),
+            # (N, 3)
+            'T': np.stack(T_list, axis=0).astype(np.float32, copy=False),
             'H': np.asarray(H_list, dtype=np.float32),          # (N,)
             'W': np.asarray(W_list, dtype=np.float32),          # (N,)
         }
