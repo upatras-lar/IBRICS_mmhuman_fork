@@ -100,7 +100,7 @@ def main():
         DATASET_CONFIGS.keys() if args.datasets == ['all'] else args.datasets)
 
     for dataset in datasets:
-        print(f'[{dataset}] Converting ...')
+        print(f'[{dataset}] Converting ... \n')
         cfg = DATASET_CONFIGS[dataset]
         prefix = cfg.pop('prefix', dataset)
         input_path = os.path.join(args.root_path, prefix)
@@ -116,7 +116,7 @@ def main():
             # Converter doesn't accept the kwarg → retry without it
             data_converter.convert(input_path, args.output_path)
 
-        print(f'[{dataset}] Converting finished!')
+        print(f'[{dataset}] Converting finished! \n')
 
 
 if __name__ == '__main__':
