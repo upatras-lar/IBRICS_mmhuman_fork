@@ -61,6 +61,9 @@ class Pw3dConverter(BaseModeConverter):
 
         meta = {}
         # meta['gender'] = []
+        
+        keypoints2d_list = []      # (J2D, 3)
+        keypoints3d_list = []      # (24, 3)
 
         # ---- New: numeric camera storage (float32) with deduplicated intrinsics ----
         # Global (dataset-level) intrinsics pool and per-frame index
@@ -99,6 +102,8 @@ class Pw3dConverter(BaseModeConverter):
                 # maybe
                 poses2d = data['poses2d']
                 global_poses = data['cam_poses']
+                
+                joint_positions = data.get('jointPositions', None)
 
                 # not in dataset
                 num_people = len(smpl_pose)
@@ -119,22 +124,32 @@ class Pw3dConverter(BaseModeConverter):
                     valid_world_trans = world_trans[i][valid[i]]
                     valid_keypoints_2d = poses2d[i][valid[i]] if poses2d is not None else None
 
+                    valid_jpos = None
+                    if joint_positions is not None:
+                        jp_i = joint_positions[i]  # shape (T, 24, 3) or (T, 72)
+                        # normalize to (T, 24, 3)
+                        jp_i = np.asarray(jp_i)
+                        if jp_i.ndim == 2 and jp_i.shape[1] == 72:
+                            jp_i = jp_i.reshape((-1, 24, 3))
+                        valid_jpos = jp_i[valid[i]]
+
                     # consider only valid frames
                     for valid_i in range(valid_pose.shape[0]):
                         have_bbox = False
                         if valid_keypoints_2d is not None:
-                            # (18,3): [x,y,conf]
-                            k = valid_keypoints_2d[valid_i].T
+                            # (J2D,3): [x,y,conf]  -- some dumps store (18,3), some (17,3)
+                            # Your original code had a .T; keep as (J,3) here to avoid confusion.
+                            k = valid_keypoints_2d[valid_i]
                             ok = np.isfinite(k[:, 2]) & (k[:, 2] > 0.0)
                             if ok.sum() >= 6:
                                 xy = k[ok, :2]
                                 x0, y0 = xy.min(axis=0)
                                 x1, y1 = xy.max(axis=0)
                                 bbox_xyxy = [x0, y0, x1, y1]
-                                bbox_xyxy = self._bbox_expand(
-                                    bbox_xyxy, scale_factor=1.2)
+                                bbox_xyxy = self._bbox_expand(bbox_xyxy, scale_factor=1.2)
                                 bbox_xywh = self._xyxy2xywh(bbox_xyxy)
                                 have_bbox = True
+
                         if not have_bbox:
                             continue
 
@@ -173,6 +188,19 @@ class Pw3dConverter(BaseModeConverter):
 
                         image_path_.append(image_path)
                         bbox_xywh_.append(bbox_xywh)
+                        
+                        
+                        # --- NEW: stash 2D and 3D keypoints for this kept frame ---
+                        # 2D: keep as-is (J,3) with (x,y,conf)
+                        if valid_keypoints_2d is not None:
+                            keypoints2d_list.append(k.astype(np.float32, copy=False))
+                        
+
+                        # 3D: add if available; else zeros of (24,3) to keep alignment
+                        if valid_jpos is not None:
+                            jp = valid_jpos[valid_i].astype(np.float32, copy=False)  # (24,3)
+                            keypoints3d_list.append(jp)
+    
 
                         # REVIEW if necessary
                         # float32 for compact storage
@@ -201,6 +229,19 @@ class Pw3dConverter(BaseModeConverter):
         
         
         
+        # NEW: finalize keypoint arrays
+        # 2D keypoints can be variable-J across dumps (17 or 18). We detect J at runtime.
+        if len(keypoints2d_list) > 0:
+            # ensure consistent J across frames
+            J2D = keypoints2d_list[0].shape[0]
+            assert all((kp.shape[0] == J2D and kp.shape[1] == 3) for kp in keypoints2d_list), \
+                "Inconsistent 2D keypoint shapes across frames"
+            keypoints2d = np.stack(keypoints2d_list, axis=0).astype(np.float32, copy=False)  # (N, J2D, 3)
+
+        if len(keypoints3d_list) > 0:
+            keypoints3d = np.stack(keypoints3d_list, axis=0).astype(np.float32, copy=False)  # (N, 24, 3)
+        
+        
         smpl['global_trans'] = np.asarray(
             smpl['global_trans'],  dtype=np.float32)
         smpl['camera_orient'] = np.asarray(
@@ -215,12 +256,17 @@ class Pw3dConverter(BaseModeConverter):
             smpl['betas'],         dtype=np.float32).reshape(-1, 10)
         
         
+        
         N = len(image_path_)
         assert all(len(smpl[k]) == N for k in ['body_pose','global_orient','global_trans',
                                             'camera_orient','camera_trans','betas'])
         assert len(bbox_xywh_) == N == len(K_idx_list) == len(R_list) == len(T_list) == len(H_list) == len(W_list)
         
-        
+        # NEW: sanity checks for keypoints
+        assert keypoints2d.shape[0] == N, "keypoints2d must align with kept frames"
+        assert keypoints3d.shape[0] == N and keypoints3d.shape[1:] == (24, 3), "keypoints3d shape mismatch"
+
+
         # shapes
         assert smpl['body_pose'].shape[1:] == (23,3)
         assert smpl['global_orient'].shape[1] == 3
@@ -233,6 +279,16 @@ class Pw3dConverter(BaseModeConverter):
         human_data['image_path'] = image_path_
         human_data['bbox_xywh'] = bbox_xywh_
         human_data['smpl'] = smpl
+        
+        
+        # NEW: add keypoints to HumanData
+        human_data['keypoints2d'] = keypoints2d  # (N, J2D, 3)
+        human_data['keypoints3d'] = keypoints3d  # (N, 24, 3)
+
+        # NEW: conventions (lightweight)
+        meta['keypoints2d_convention'] = 'coco'
+        meta['keypoints3d_convention'] = 'smpl_24'
+        human_data['meta'] = meta
 
         if K_pool_list:
             K_pool = np.stack(K_pool_list, axis=0).astype(
