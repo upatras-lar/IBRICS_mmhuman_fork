@@ -238,6 +238,11 @@ class Pw3dConverter(BaseModeConverter):
         keypoints2d = np.stack(keypoints2d_list, axis=0).astype(np.float32, copy=False)  # (N, 18, 3)
         keypoints3d = np.stack(keypoints3d_list, axis=0).astype(np.float32, copy=False)  # (N, 24, 3)
 
+        # keypoints3d: (N, 24, 3) -> (N, 24, 4) with dummy conf=1.0
+        keypoints3d_conf = np.ones((keypoints3d.shape[0], keypoints3d.shape[1], 1), dtype=np.float32)
+        keypoints3d = np.concatenate([keypoints3d, keypoints3d_conf], axis=2)
+
+
         
         smpl['global_trans'] = np.asarray(
             smpl['global_trans'],  dtype=np.float32)
@@ -261,7 +266,8 @@ class Pw3dConverter(BaseModeConverter):
         
         # NEW: sanity checks for keypoints
         assert keypoints2d.shape == (N, 18, 3)
-        assert keypoints3d.shape == (N, 24, 3)
+        # update sanity check
+        assert keypoints3d.shape == (N, 24, 4)
 
 
         # shapes
