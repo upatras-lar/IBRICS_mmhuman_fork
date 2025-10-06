@@ -126,11 +126,7 @@ class Pw3dConverter(BaseModeConverter):
 
                     valid_jpos = None
                     if joint_positions is not None:
-                        jp_i = joint_positions[i]  # shape (T, 24, 3) or (T, 72)
-                        # normalize to (T, 24, 3)
-                        jp_i = np.asarray(jp_i)
-                        if jp_i.ndim == 2 and jp_i.shape[1] == 72:
-                            jp_i = jp_i.reshape((-1, 24, 3))
+                        jp_i = joint_positions[i].reshape(-1, 24, 3)          # float64 ok; cast later
                         valid_jpos = jp_i[valid[i]]
 
                     # consider only valid frames
@@ -140,6 +136,7 @@ class Pw3dConverter(BaseModeConverter):
                             # (J2D,3): [x,y,conf]  -- some dumps store (18,3), some (17,3)
                             # Your original code had a .T; keep as (J,3) here to avoid confusion.
                             k = valid_keypoints_2d[valid_i]
+                            k = k.T.astype(np.float32, copy=False) 
                             ok = np.isfinite(k[:, 2]) & (k[:, 2] > 0.0)
                             if ok.sum() >= 6:
                                 xy = k[ok, :2]
@@ -148,6 +145,14 @@ class Pw3dConverter(BaseModeConverter):
                                 bbox_xyxy = [x0, y0, x1, y1]
                                 bbox_xyxy = self._bbox_expand(bbox_xyxy, scale_factor=1.2)
                                 bbox_xywh = self._xyxy2xywh(bbox_xyxy)
+                                
+                                # if clamping is needed
+                                # x, y, w_box, h_box = bbox_xywh
+                                # x = max(0.0, min(x, w - 1.0))
+                                # y = max(0.0, min(y, h - 1.0))
+                                # w_box = max(1.0, min(w_box, (w - x)))
+                                # h_box = max(1.0, min(h_box, (h - y)))
+                                # bbox_xywh = [x, y, w_box, h_box]
                                 have_bbox = True
 
                         if not have_bbox:
@@ -191,15 +196,13 @@ class Pw3dConverter(BaseModeConverter):
                         
                         
                         # --- NEW: stash 2D and 3D keypoints for this kept frame ---
-                        # 2D: keep as-is (J,3) with (x,y,conf)
-                        if valid_keypoints_2d is not None:
-                            keypoints2d_list.append(k.astype(np.float32, copy=False))
+                        # 2D: keep as (18,3) (x,y,conf)
+                        keypoints2d_list.append(k)
                         
 
                         # 3D: add if available; else zeros of (24,3) to keep alignment
-                        if valid_jpos is not None:
-                            jp = valid_jpos[valid_i].astype(np.float32, copy=False)  # (24,3)
-                            keypoints3d_list.append(jp)
+                        jp = valid_jpos[valid_i].astype(np.float32, copy=False)
+                        keypoints3d_list.append(jp)
     
 
                         # REVIEW if necessary
@@ -231,16 +234,10 @@ class Pw3dConverter(BaseModeConverter):
         
         # NEW: finalize keypoint arrays
         # 2D keypoints can be variable-J across dumps (17 or 18). We detect J at runtime.
-        if len(keypoints2d_list) > 0:
-            # ensure consistent J across frames
-            J2D = keypoints2d_list[0].shape[0]
-            assert all((kp.shape[0] == J2D and kp.shape[1] == 3) for kp in keypoints2d_list), \
-                "Inconsistent 2D keypoint shapes across frames"
-            keypoints2d = np.stack(keypoints2d_list, axis=0).astype(np.float32, copy=False)  # (N, J2D, 3)
+        # N kept frames expected
+        keypoints2d = np.stack(keypoints2d_list, axis=0).astype(np.float32, copy=False)  # (N, 18, 3)
+        keypoints3d = np.stack(keypoints3d_list, axis=0).astype(np.float32, copy=False)  # (N, 24, 3)
 
-        if len(keypoints3d_list) > 0:
-            keypoints3d = np.stack(keypoints3d_list, axis=0).astype(np.float32, copy=False)  # (N, 24, 3)
-        
         
         smpl['global_trans'] = np.asarray(
             smpl['global_trans'],  dtype=np.float32)
@@ -263,8 +260,8 @@ class Pw3dConverter(BaseModeConverter):
         assert len(bbox_xywh_) == N == len(K_idx_list) == len(R_list) == len(T_list) == len(H_list) == len(W_list)
         
         # NEW: sanity checks for keypoints
-        assert keypoints2d.shape[0] == N, "keypoints2d must align with kept frames"
-        assert keypoints3d.shape[0] == N and keypoints3d.shape[1:] == (24, 3), "keypoints3d shape mismatch"
+        assert keypoints2d.shape == (N, 18, 3)
+        assert keypoints3d.shape == (N, 24, 3)
 
 
         # shapes
@@ -281,14 +278,13 @@ class Pw3dConverter(BaseModeConverter):
         human_data['smpl'] = smpl
         
         
-        # NEW: add keypoints to HumanData
-        human_data['keypoints2d'] = keypoints2d  # (N, J2D, 3)
-        human_data['keypoints3d'] = keypoints3d  # (N, 24, 3)
+        human_data['keypoints2d'] = keypoints2d  # (N, 18, 3) COCO
+        human_data['keypoints3d'] = keypoints3d  # (N, 24, 3) SMPL joints
 
-        # NEW: conventions (lightweight)
-        meta['keypoints2d_convention'] = 'coco'
+        meta['keypoints2d_convention'] = 'coco_18'
         meta['keypoints3d_convention'] = 'smpl_24'
         human_data['meta'] = meta
+
 
         if K_pool_list:
             K_pool = np.stack(K_pool_list, axis=0).astype(
