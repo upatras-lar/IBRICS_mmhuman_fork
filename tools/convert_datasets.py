@@ -113,7 +113,7 @@ def main():
                 enable_multi_human_data=args.enable_multi_human_data
             )
         except TypeError:
-            # Converter doesn't accept the kwarg → retry without it
+            # Converter doesn't accept the kwarg so i need to retry without it
             data_converter.convert(input_path, args.output_path)
 
         print(f'[{dataset}] Converting finished! \n')
